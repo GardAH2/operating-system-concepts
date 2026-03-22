@@ -1,0 +1,364 @@
+#!/bin/bash
+
+# ==============================================================================
+# onboard_users.sh — Automated User Onboarding Script
+# ==============================================================================
+# Purpose: Reads user records from a CSV file and creates/updates Linux accounts
+#          with appropriate group memberships, home directories, and project folders.
+#
+# Usage:   sudo bash onboard_users.sh
+# Input:   users.csv (must be in the same directory)
+# Output:  User accounts created/updated, logged to /var/log/user_onboarding_audit.log
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+CSV_FILE="users.csv"
+LOG_FILE="/var/log/user_onboarding_audit.log"
+PROJECT_BASE="/opt/projects"
+
+# ------------------------------------------------------------------------------
+# log() — Writes timestamped messages to the audit log and stdout
+# Arguments: $1 = message string
+# This provides a complete audit trail for compliance and troubleshooting.
+# ------------------------------------------------------------------------------
+log() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="[$timestamp] $1"
+    echo "$message" | sudo tee -a "$LOG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# validate_username() — Checks if a username meets Linux naming conventions
+# Arguments: $1 = username to validate
+# Returns:   0 if valid, 1 if invalid
+# Valid usernames: start with lowercase letter, contain only lowercase letters,
+# digits, hyphens, and underscores, maximum 32 characters.
+# ------------------------------------------------------------------------------
+validate_username() {
+    local username="$1"
+    if [[ "$username" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Pre-flight checks
+# ------------------------------------------------------------------------------
+
+# Verify script is running with root privileges — required for user management
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: This script must be run as root (use sudo)."
+    exit 1
+fi
+
+# Verify the CSV input file exists before attempting to process it
+if [[ ! -f "$CSV_FILE" ]]; then
+    echo "ERROR: Input file '$CSV_FILE' not found in current directory."
+    exit 1
+fi
+
+# Create the projects base directory if it doesn't exist
+# This is done once at startup rather than checking for each user
+if [[ ! -d "$PROJECT_BASE" ]]; then
+    mkdir -p "$PROJECT_BASE"
+    log "Created project base directory: $PROJECT_BASE"
+fi
+
+# ------------------------------------------------------------------------------
+# Main processing loop — iterate through each line in the CSV
+# ------------------------------------------------------------------------------
+log "========== User onboarding started =========="
+log "Reading from: $CSV_FILE"
+
+# Track statistics for the summary
+users_created=0
+users_updated=0
+errors_encountered=0
+
+# IFS=',' tells read to split each line on commas, extracting the three fields.
+# -r prevents backslash interpretation in usernames.
+while IFS=',' read -r username groupname shell || [[ -n "$username" ]]; do
+
+    # --------------------------------------------------------------------------
+    # Step 1: Clean whitespace from fields
+    # CSV files often have spaces after commas; trim them to avoid issues
+    # --------------------------------------------------------------------------
+    username=$(echo "$username" | xargs)
+    groupname=$(echo "$groupname" | xargs)
+    shell=$(echo "$shell" | xargs)
+
+    # --------------------------------------------------------------------------
+    # Step 2: Skip blank lines and comments
+    # Lines starting with # are treated as comments for documentation purposes
+    # --------------------------------------------------------------------------
+    if [[ -z "$username" ]] || [[ "$username" =~ ^# ]]; then
+        continue
+    fi
+
+    log "Processing user: $username"
+
+    # --------------------------------------------------------------------------
+    # Step 3: Validate all required fields are present
+    # A record missing any field cannot be processed safely
+    # --------------------------------------------------------------------------
+    if [[ -z "$username" || -z "$groupname" || -z "$shell" ]]; then
+        log "ERROR: Missing field(s) for record '$username' — skipping"
+        ((errors_encountered++))
+        continue
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 4: Validate username format
+    # Prevents creation of accounts with invalid names that could cause issues
+    # --------------------------------------------------------------------------
+    if ! validate_username "$username"; then
+        log "ERROR: Invalid username '$username' (must start with lowercase letter, contain only a-z, 0-9, _, -) — skipping"
+        ((errors_encountered++))
+        continue
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 5: Validate shell exists on the system
+    # Warn but proceed — the shell might be valid but not in /etc/shells
+    # --------------------------------------------------------------------------
+    if ! grep -qx "$shell" /etc/shells 2>/dev/null; then
+        log "WARNING: Shell '$shell' not found in /etc/shells — proceeding anyway"
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 6: Ensure the group exists (create if necessary)
+    # Groups must exist before users can be added to them
+    # --------------------------------------------------------------------------
+    if getent group "$groupname" >/dev/null 2>&1; then
+        log "Group '$groupname' already exists"
+    else
+        if groupadd "$groupname"; then
+            log "Created group: $groupname"
+        else
+            log "ERROR: Failed to create group '$groupname' — skipping user $username"
+            ((errors_encountered++))
+            continue
+        fi
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 7: Create or update the user account
+    # If user exists, update their shell; otherwise create with home directory
+    # --------------------------------------------------------------------------
+    if id "$username" >/dev/null 2>&1; then
+        # User exists — update their shell to match the CSV specification
+        if usermod -s "$shell" "$username"; then
+            log "Updated existing user '$username' — shell set to $shell"
+            ((users_updated++))
+        else
+            log "ERROR: Failed to update shell for user '$username'"
+            ((errors_encountered++))
+            continue
+        fi
+    else
+        # User doesn't exist — create with home directory and specified shell
+        # -m creates the home directory, -s sets the login shell
+        if useradd -m -s "$shell" "$username"; then
+            log "Created new user: $username (shell: $shell)"
+            ((users_created++))
+        else
+            log "ERROR: Failed to create user '$username'"
+            ((errors_encountered++))
+            continue
+        fi
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 8: Add user to the specified supplementary group
+    # -aG appends to existing groups without removing current memberships
+    # --------------------------------------------------------------------------
+    if usermod -aG "$groupname" "$username"; then
+        log "Added '$username' to group '$groupname'"
+    else
+        log "ERROR: Failed to add '$username' to group '$groupname'"
+        ((errors_encountered++))
+    fi
+
+    # --------------------------------------------------------------------------
+    # Step 9: Verify and secure the home directory
+    # 700 permissions ensure only the owner can access their home directory
+    # --------------------------------------------------------------------------
+    home_dir="/home/$username"
+    if [[ ! -d "$home_dir" ]]; then
+        # Home directory missing (shouldn't happen with useradd -m, but handle it)
+        if mkdir -p "$home_dir"; then
+            log "Created missing home directory: $home_dir"
+        else
+            log "ERROR: Failed to create home directory for '$username'"
+            ((errors_encountered++))
+        fi
+    fi
+
+    # Set ownership to user:user (primary group) and restrictive permissions
+    chown "$username":"$username" "$home_dir"
+    chmod 700 "$home_dir"
+    log "Secured home directory $home_dir (owner: $username, permissions: 700)"
+
+    # --------------------------------------------------------------------------
+    # Step 10: Create the user's project directory
+    # 750 allows owner full access and group members read/execute
+    # --------------------------------------------------------------------------
+    project_dir="$PROJECT_BASE/$username"
+    if [[ ! -d "$project_dir" ]]; then
+        if mkdir -p "$project_dir"; then
+            log "Created project directory: $project_dir"
+        else
+            log "ERROR: Failed to create project directory for '$username'"
+            ((errors_encountered++))
+            continue
+        fi
+    fi
+
+    # Set ownership to user:groupname so group members can collaborate
+    chown "$username":"$groupname" "$project_dir"
+    chmod 750 "$project_dir"
+    log "Configured project directory $project_dir (owner: $username:$groupname, permissions: 750)"
+
+    log "Completed processing for user: $username"
+    echo "---"
+
+done < "$CSV_FILE"
+
+# ------------------------------------------------------------------------------
+# Summary — report what was accomplished
+# ------------------------------------------------------------------------------
+log "========== User onboarding completed =========="
+log "Summary: $users_created created, $users_updated updated, $errors_encountered errors"
+
+echo ""
+echo "=============================="
+echo "Onboarding Complete"
+echo "=============================="
+echo "Users created:  $users_created"
+echo "Users updated:  $users_updated"
+echo "Errors:         $errors_encountered"
+echo "Log file:       $LOG_FILE"
+echo "=============================="
+
+TASK 3
+
+#!/bin/bash
+
+# ==============================================================================
+# critical_log_analysis.sh — Critical Log Entry Analyzer
+# ==============================================================================
+# Purpose: Analyzes system logs to identify the most frequently occurring terms
+#          in critical-level entries (ERROR, CRITICAL, FATAL), helping prioritize
+#          which issues to investigate first.
+#
+# Usage:   bash critical_log_analysis.sh
+# Input:   sys_log.txt (must be in the same directory)
+# Output:  Top 10 terms displayed on screen and saved to top10_critical.txt
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+LOG_FILE="sys_log.txt"
+OUTPUT_FILE="top10_critical.txt"
+
+# ------------------------------------------------------------------------------
+# Pre-flight check — verify the log file exists
+# ------------------------------------------------------------------------------
+if [[ ! -f "$LOG_FILE" ]]; then
+    echo "ERROR: Log file '$LOG_FILE' not found in current directory."
+    echo "Make sure you're in the checkpoint1-files directory."
+    exit 1
+fi
+
+echo "Analyzing critical entries in: $LOG_FILE"
+echo ""
+
+# ------------------------------------------------------------------------------
+# Step 1: Filter critical log lines
+# Extract only lines containing ERROR, CRITICAL, or FATAL (case-insensitive).
+# Using -i for case-insensitivity catches variations like "Error" or "error".
+# Using -E enables extended regex for the alternation (|) operator.
+# Store in a variable to avoid re-reading the file in subsequent steps.
+# ------------------------------------------------------------------------------
+filtered_lines=$(grep -iE "ERROR|CRITICAL|FATAL" "$LOG_FILE")
+
+# Check if any critical entries were found
+if [[ -z "$filtered_lines" ]]; then
+    echo "No ERROR, CRITICAL, or FATAL entries found in the log file."
+    echo "0 critical entries" > "$OUTPUT_FILE"
+    exit 0
+fi
+
+# Count how many critical lines were found for informational purposes
+critical_count=$(echo "$filtered_lines" | wc -l)
+echo "Found $critical_count critical log entries"
+echo ""
+
+# ------------------------------------------------------------------------------
+# Step 2: Tokenize the filtered lines
+# Convert the filtered text into individual words (one per line) for counting.
+#
+# Pipeline explanation:
+#   tr '[:space:]' '\n'  — Replace all whitespace (spaces, tabs) with newlines,
+#                          putting each word on its own line
+#   tr '[:upper:]' '[:lower:]' — Convert to lowercase so "Error" and "error"
+#                                 are counted together
+#   sed 's/[^a-z0-9]//g' — Remove all non-alphanumeric characters (punctuation)
+#                          so "error:" and "error" become identical
+#   grep -v '^$'         — Remove empty lines created by multiple spaces or
+#                          lines that were only punctuation
+# ------------------------------------------------------------------------------
+tokens=$(echo "$filtered_lines" \
+    | tr '[:space:]' '\n' \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]//g' \
+    | grep -v '^$')
+
+# ------------------------------------------------------------------------------
+# Step 3: Count frequency and identify the top 10 terms
+#
+# Pipeline explanation:
+#   sort              — Sort alphabetically so identical words are adjacent
+#                       (required for uniq to work correctly)
+#   uniq -c           — Count consecutive identical lines, outputting "count word"
+#   sort -rn          — Sort numerically (-n) in reverse order (-r) so highest
+#                       counts appear first
+#   head -10          — Take only the top 10 results
+# ------------------------------------------------------------------------------
+echo "Top 10 most frequent terms in critical entries:"
+echo "================================================"
+
+top_terms=$(echo "$tokens" | sort | uniq -c | sort -rn | head -10)
+
+# Display results on screen with nice formatting
+echo "$top_terms" | while read count term; do
+    printf "%6d  %s\n" "$count" "$term"
+done
+
+echo "================================================"
+echo ""
+
+# ------------------------------------------------------------------------------
+# Step 4: Save results to output file
+# Write the top 10 results to a file for later reference or reporting.
+# Using > overwrites any existing file with the same name.
+# ------------------------------------------------------------------------------
+echo "$top_terms" > "$OUTPUT_FILE"
+
+# Verify the file was created successfully
+if [[ -f "$OUTPUT_FILE" ]]; then
+    echo "Results saved to $OUTPUT_FILE"
+    echo ""
+    echo "File contents:"
+    cat "$OUTPUT_FILE"
+else
+    echo "ERROR: Failed to save results to $OUTPUT_FILE"
+    exit 1
+fi
+
